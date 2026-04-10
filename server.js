@@ -10,11 +10,13 @@ const DATA_DIR = path.join(ROOT, 'data');
 const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 const INITIAL_PASSWORD_PATH = path.join(DATA_DIR, 'initial-password.txt');
 const FORCE_PUBLIC_IP = '8.137.127.174';
-const PORT = 18888;
-const HOST = '127.0.0.1';
-const BASE_PATH = '/sysinfo';
+const PORT = Number.parseInt(process.env.PORT || '18888', 10);
+const HOST = process.env.HOST || '127.0.0.1';
+const BASE_PATH = process.env.BASE_PATH || '/sysinfo';
 const SESSION_COOKIE = 'sysinfo_panel_session';
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const DEFAULT_USERNAME = 'admin';
+const DEFAULT_PASSWORD = '123456';
 
 function run(cmd) {
   try {
@@ -60,11 +62,29 @@ function hashPassword(password, salt) {
   return crypto.scryptSync(password, salt, 64).toString('hex');
 }
 
+function ensureRuntimeFiles() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.mkdirSync(path.join(ROOT, 'logs'), { recursive: true });
+  if (!fs.existsSync(CONFIG_PATH)) {
+    const salt = crypto.randomBytes(16).toString('hex');
+    const passwordHash = hashPassword(DEFAULT_PASSWORD, salt);
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify({
+      username: DEFAULT_USERNAME,
+      salt,
+      passwordHash,
+    }, null, 2));
+  }
+  if (!fs.existsSync(INITIAL_PASSWORD_PATH)) {
+    fs.writeFileSync(INITIAL_PASSWORD_PATH, `${DEFAULT_PASSWORD}\n`);
+  }
+}
+
 function readAuthConfig() {
+  ensureRuntimeFiles();
   const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
   const parsed = JSON.parse(raw);
   return {
-    username: parsed.username || 'admin',
+    username: parsed.username || DEFAULT_USERNAME,
     salt: parsed.salt,
     passwordHash: parsed.passwordHash,
   };
@@ -661,6 +681,7 @@ function renderLogin(errorMessage = '') {
     <div class="login">
       <h1 class="title">sysinfo-panel 登录</h1>
       <div class="muted">请输入用户名和密码</div>
+      <div class="muted" style="margin-top:8px; font-size:12px;">默认账号密码：${DEFAULT_USERNAME} / ${DEFAULT_PASSWORD}</div>
       ${errorMessage ? `<div class="error">${htmlEscape(errorMessage)}</div>` : ''}
       <form method="post" action="${BASE_PATH}/login">
         <div class="field">
@@ -898,6 +919,8 @@ async function handler(req, res) {
   res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
   res.end(method === 'HEAD' ? '' : 'Not found');
 }
+
+ensureRuntimeFiles();
 
 http.createServer((req, res) => {
   Promise.resolve(handler(req, res)).catch(err => {

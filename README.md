@@ -2,6 +2,8 @@
 
 一个轻量的系统信息面板，基于 Node.js 原生 HTTP 服务实现。
 
+> 目标：`git clone` 后几乎零配置即可直接启动。
+
 ## 项目结构
 
 - `server.js`：主服务与页面渲染
@@ -28,10 +30,19 @@
 - 基础移动端 / 平板端适配
 - 赛博风界面与动效
 
-## 启动
+## 快速开始
+
+### 1. 克隆项目
 
 ```bash
-node server.js
+git clone https://github.com/TlyHj/sysinfo_panel.git
+cd sysinfo_panel
+```
+
+### 2. 启动
+
+```bash
+npm start
 ```
 
 或：
@@ -40,10 +51,30 @@ node server.js
 bash ./start.sh
 ```
 
+### 3. 默认登录
+
+首次启动会自动生成运行目录与认证配置。
+
+- 用户名：`admin`
+- 密码：`123456`
+
+## 运行机制
+
+- 首次启动自动创建 `data/` 和 `logs/`
+- 首次启动自动生成 `data/config.json`
+- 仓库内不提交运行期密码文件、配置文件、日志文件
+- 示例配置见：`data.example/config.example.json`
+
 ## 默认监听
 
 - `127.0.0.1:18888`
 - 基础路径：`/sysinfo`
+
+也支持环境变量覆盖：
+
+```bash
+PORT=18989 HOST=127.0.0.1 BASE_PATH=/sysinfo npm start
+```
 
 ## 说明
 
