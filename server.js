@@ -256,6 +256,11 @@ function formatRefreshLabel(seconds) {
   return `${seconds} 秒自动刷新`;
 }
 
+function formatPercent(value, total) {
+  if (!Number.isFinite(value) || !Number.isFinite(total) || total <= 0) return 'N/A';
+  return `${((value / total) * 100).toFixed(1)}%`;
+}
+
 function buildRefreshOptions(refreshSeconds) {
   const baseOptions = [0, 5, 30, 60, 300];
   const values = new Set(baseOptions);
@@ -325,6 +330,32 @@ function getServiceSnapshot() {
   });
 }
 
+function parseTopProcesses(raw) {
+  if (!raw || raw === 'N/A') return [];
+  const lines = raw.split('\n').map(s => s.trimEnd()).filter(Boolean);
+  if (lines.length <= 1) return [];
+  return lines.slice(1).map(line => {
+    const parts = line.trim().split(/\s+/, 8);
+    const [pid, ppid, user, cpu, mem, etime, comm, args] = parts;
+    const cpuNum = Number.parseFloat(cpu || '0');
+    const memNum = Number.parseFloat(mem || '0');
+    let state = 'ok';
+    if (cpuNum >= 60 || memNum >= 25) state = 'danger';
+    else if (cpuNum >= 25 || memNum >= 10) state = 'warn';
+    return {
+      pid: pid || 'N/A',
+      ppid: ppid || 'N/A',
+      user: user || 'N/A',
+      cpu: Number.isFinite(cpuNum) ? cpuNum : 0,
+      mem: Number.isFinite(memNum) ? memNum : 0,
+      etime: etime || 'N/A',
+      comm: comm || 'N/A',
+      args: args || comm || 'N/A',
+      state,
+    };
+  });
+}
+
 function getAlertSummary(data) {
   const alerts = [];
   const load1 = Number(data.overview.loadavg?.[0] || 0);
@@ -364,6 +395,12 @@ function getAlertSummary(data) {
     else if (c.restarting || c.exited) alerts.push({ level: 'warn', text: `容器状态异常：${c.name} (${c.status})` });
   }
 
+  for (const p of data.processes || []) {
+    if (p.cpu >= 80) alerts.push({ level: 'critical', text: `高 CPU 进程：PID ${p.pid} ${p.comm} 占用 ${p.cpu.toFixed(1)}%` });
+    else if (p.cpu >= 50) alerts.push({ level: 'warn', text: `CPU 偏高进程：PID ${p.pid} ${p.comm} 占用 ${p.cpu.toFixed(1)}%` });
+    if (p.mem >= 30) alerts.push({ level: 'warn', text: `高内存进程：PID ${p.pid} ${p.comm} 占用 ${p.mem.toFixed(1)}%` });
+  }
+
   const counts = alerts.reduce((acc, item) => {
     acc[item.level] = (acc[item.level] || 0) + 1;
     return acc;
@@ -396,6 +433,7 @@ function getData() {
   const disk = run('df -hP -x tmpfs -x devtmpfs 2>/dev/null | head -n 80');
   const services = getServiceSnapshot();
   const docker = run('docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null | head -n 80');
+  const top = run('ps -eo pid,ppid,user,%cpu,%mem,etime,comm,args --sort=-%cpu | head -n 30');
   const data = {
     time: formatBeijingTime(),
     listenSummary: getListenSummary(),
@@ -417,7 +455,8 @@ function getData() {
     listening: run('ss -tulpn 2>/dev/null | head -n 80'),
     docker,
     dockerContainers: parseDockerContainers(docker),
-    top: run('ps -eo pid,ppid,user,%cpu,%mem,etime,comm,args --sort=-%cpu | head -n 30'),
+    top,
+    processes: parseTopProcesses(top),
     who: run('who 2>/dev/null | head -n 30'),
     lastLogins: run('last -n 20 2>/dev/null'),
     services,
@@ -432,6 +471,7 @@ function moduleDefs(data) {
     : '当前没有触发中的告警';
   const servicesPreview = (data.services || []).filter(s => s.present).map(s => `${s.name}\t${s.active}\t${s.enabled}\t${s.sub}`).join('\n') || 'N/A';
   const dockerPreview = (data.dockerContainers || []).map(c => `${c.name}\t${c.status}\t${c.ports}`).join('\n') || 'N/A';
+  const processPreview = (data.processes || []).slice(0, 8).map(p => `${p.pid}\t${p.user}\tCPU ${p.cpu.toFixed(1)}%\tMEM ${p.mem.toFixed(1)}%\t${p.comm}`).join('\n') || 'N/A';
   const modules = [
     {
       key: 'overview',
@@ -468,7 +508,7 @@ function moduleDefs(data) {
     { key: 'disk', title: '磁盘使用', desc: `挂载点 ${data.diskUsage.length} 个`, content: data.disk },
     { key: 'ports', title: '监听端口', desc: '查看当前监听套接字与进程', content: data.listening },
     { key: 'docker', title: 'Docker 容器', desc: `共 ${(data.dockerContainers || []).length} 个容器`, content: dockerPreview },
-    { key: 'processes', title: '高占用进程', desc: '按 CPU 排序展示进程', content: data.top },
+    { key: 'processes', title: '进程监控', desc: `Top ${(data.processes || []).length} ｜ 按 CPU 排序`, content: processPreview },
     { key: 'sessions', title: '当前登录', desc: '查看当前登录会话', content: data.who },
     { key: 'logins', title: '最近登录记录', desc: '查看 last 登录记录', content: data.lastLogins },
   ];
@@ -487,42 +527,123 @@ function layout(title, body, refreshSeconds = 0) {
   <style>
     :root { color-scheme: dark; }
     * { box-sizing: border-box; }
-    body { margin: 0; font-family: Inter, system-ui, sans-serif; background: #0b1220; color: #e5edf7; }
-    .wrap { max-width: 1200px; margin: 0 auto; padding: 24px; }
-    .topbar { display:flex; justify-content:space-between; align-items:flex-start; gap: 12px; margin-bottom: 18px; }
-    .title { margin: 0; font-size: 28px; }
+    body { margin: 0; font-family: Inter, system-ui, sans-serif; background:
+      radial-gradient(circle at 86% 10%, rgba(255, 225, 77, .28), transparent 16%),
+      radial-gradient(circle at 10% 16%, rgba(34, 211, 238, .26), transparent 22%),
+      radial-gradient(circle at 74% 76%, rgba(236, 72, 153, .16), transparent 18%),
+      linear-gradient(135deg, #04070d 0%, #08101d 34%, #0b1220 58%, #10192d 100%);
+      color: #e5edf7; }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 24px; position: relative; z-index: 1; }
+    body::before { content:''; position:fixed; inset:0; pointer-events:none; background:
+      linear-gradient(115deg, transparent 0 32%, rgba(255, 224, 102, .08) 32% 38%, transparent 38% 100%),
+      linear-gradient(rgba(80, 227, 194, .06) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.028) 1px, transparent 1px);
+      background-size: auto, 100% 6px, 6px 100%; opacity:.95; }
+    body::after { content:''; position:fixed; inset:0; pointer-events:none; background:
+      linear-gradient(90deg, transparent 0%, rgba(34,211,238,.12) 22%, transparent 40%, rgba(255,230,109,.10) 58%, transparent 76%),
+      radial-gradient(circle at center, rgba(255,255,255,.05), transparent 55%),
+      radial-gradient(circle at 80% 20%, rgba(255,230,109,.08), transparent 28%);
+      mix-blend-mode:screen; animation: sweepGlow 8s linear infinite; }
+    .fxLayer { position:fixed; inset:0; pointer-events:none; overflow:hidden; }
+    .fxGrid { z-index:0; opacity:.9; }
+    .fxGrid::before,
+    .fxGrid::after { content:''; position:absolute; inset:-10% -10%; }
+    .fxGrid::before { background:
+      linear-gradient(90deg, rgba(255,255,255,.028) 1px, transparent 1px),
+      linear-gradient(rgba(255,255,255,.022) 1px, transparent 1px);
+      background-size: 24px 24px, 24px 24px;
+      mask-image: radial-gradient(circle at center, black 38%, transparent 82%);
+      opacity:.28; }
+    .fxGrid::after { background:
+      linear-gradient(90deg, transparent 0 24%, rgba(34,211,238,.16) 24% 26%, transparent 26% 100%),
+      linear-gradient(transparent 0 44%, rgba(250,204,21,.12) 44% 46%, transparent 46% 100%);
+      background-size: 160px 160px, 120px 120px;
+      mix-blend-mode:screen;
+      opacity:.26;
+      animation: pixelDrift 24s linear infinite; }
+    .fxPixels { z-index:0; opacity:.9; }
+    .fxPixels::before,
+    .fxPixels::after { content:''; position:absolute; inset:0; }
+    .fxPixels::before { background:
+      radial-gradient(circle at 16% 18%, rgba(34,211,238,.18) 0 1px, transparent 1.5px),
+      radial-gradient(circle at 76% 22%, rgba(250,204,21,.16) 0 1px, transparent 1.5px),
+      radial-gradient(circle at 68% 70%, rgba(244,114,182,.14) 0 1px, transparent 1.5px),
+      radial-gradient(circle at 28% 78%, rgba(125,211,252,.14) 0 1px, transparent 1.5px),
+      radial-gradient(circle at 88% 58%, rgba(34,211,238,.13) 0 1px, transparent 1.5px);
+      background-size: 220px 220px, 260px 260px, 240px 240px, 280px 280px, 320px 320px;
+      image-rendering: pixelated;
+      filter: drop-shadow(0 0 6px rgba(34,211,238,.10));
+      animation: pixelPulse 9s ease-in-out infinite; }
+    .fxPixels::after { background:
+      linear-gradient(90deg, rgba(34,211,238,.0) 0 20%, rgba(34,211,238,.10) 20% 21%, rgba(34,211,238,0) 21% 100%),
+      linear-gradient(90deg, rgba(250,204,21,0) 0 74%, rgba(250,204,21,.12) 74% 75%, rgba(250,204,21,0) 75% 100%);
+      background-size: 220px 220px, 300px 300px;
+      mix-blend-mode:screen;
+      opacity:.22;
+      animation: pixelSweep 14s linear infinite; }
+    .meteorField { z-index:0; }
+    .meteor { position:absolute; right:-18vw; top:0; width:22vw; height:2px; border-radius:999px; background:linear-gradient(90deg, rgba(255,255,255,.98) 0%, rgba(255,255,255,.92) 4%, rgba(34,211,238,.86) 12%, rgba(34,211,238,.34) 28%, rgba(250,204,21,.12) 52%, rgba(250,204,21,0) 100%); box-shadow: 0 0 10px rgba(34,211,238,.26), 0 0 22px rgba(250,204,21,.16); transform: rotate(-22deg); opacity:0; }
+    .meteor::after { content:''; position:absolute; left:-1px; top:-3px; width:8px; height:8px; background:#fff7c2; box-shadow: 0 0 10px rgba(255,243,176,.95), 0 0 20px rgba(34,211,238,.36); clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%); }
+    .meteor.m1 { top:10%; animation: meteorFly1 8.5s linear infinite; animation-delay: .2s; }
+    .meteor.m2 { top:22%; width:16vw; animation: meteorFly2 11s linear infinite; animation-delay: 1.6s; }
+    .meteor.m3 { top:34%; width:20vw; animation: meteorFly3 9.5s linear infinite; animation-delay: 3.1s; }
+    .meteor.m4 { top:48%; width:14vw; animation: meteorFly4 12.5s linear infinite; animation-delay: .9s; }
+    .meteor.m5 { top:62%; width:18vw; animation: meteorFly5 10.5s linear infinite; animation-delay: 4.4s; }
+    .meteor.m6 { top:74%; width:15vw; animation: meteorFly2 9.8s linear infinite; animation-delay: 5.8s; opacity:0; }
+    .meteor.m7 { top:86%; width:19vw; animation: meteorFly4 13.2s linear infinite; animation-delay: 2.7s; opacity:0; }
+    .topbar { display:flex; justify-content:space-between; align-items:flex-start; gap: 12px; margin-bottom: 18px; position:relative; padding-bottom:14px; }
+    .topbar::after { content:''; position:absolute; left:0; right:0; bottom:0; height:1px; background:linear-gradient(90deg, rgba(34,211,238,.0), rgba(34,211,238,.5), rgba(250,204,21,.45), rgba(34,211,238,0)); }
+    .title { margin: 0; font-size: 28px; text-shadow: 0 0 18px rgba(56,189,248,.18); letter-spacing:.04em; text-transform: uppercase; }
     .muted { color:#9fb0cb; }
+    .heroStats { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 0 0 16px; }
+    .heroStat { position:relative; overflow:hidden; background: linear-gradient(180deg, rgba(16,24,39,.78), rgba(10,14,24,.66)); border:1px solid rgba(250, 204, 21, .24); border-radius: 16px; padding: 14px 16px; box-shadow: 0 10px 30px rgba(0,0,0,.18), 0 0 18px rgba(250,204,21,.08); clip-path: polygon(0 0, calc(100% - 16px) 0, 100% 16px, 100% 100%, 14px 100%, 0 calc(100% - 14px)); backdrop-filter: blur(8px); }
+    .heroStat::before { content:''; position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg, #22d3ee, #fde047, #f472b6); }
+    .heroStat::after { content:''; position:absolute; inset:auto -20% 0 auto; width:120px; height:120px; border-radius:50%; background: radial-gradient(circle, rgba(250,204,21,.18), transparent 70%); }
+    .heroLabel { font-size:12px; color:#8ea5c8; margin-bottom:8px; }
+    .heroValue { font-size:22px; font-weight:800; color:#eaf4ff; }
+    .heroSub { margin-top:6px; font-size:12px; color:#9fb0cb; }
     .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; }
-    .card { display:block; background:#121a2b; border:1px solid #22304d; border-radius:16px; padding:16px; box-shadow: 0 10px 30px rgba(0,0,0,.2); color:inherit; text-decoration:none; transition: transform .22s ease, border-color .22s ease, box-shadow .22s ease, background .22s ease; animation: fadeSlideIn .35s ease both; }
-    .card:hover { border-color:#3b82f6; transform: translateY(-4px); box-shadow: 0 18px 38px rgba(29,78,216,.18); background:#151f34; }
-    .cardTitle { font-size:18px; font-weight:700; margin:0 0 10px; }
+    .card { display:block; background:linear-gradient(180deg, rgba(18,26,43,.76), rgba(12,18,31,.68)); border:1px solid rgba(52, 211, 235, .24); border-radius:16px; padding:16px; box-shadow: 0 10px 30px rgba(0,0,0,.2), 0 0 0 1px rgba(34,211,238,.05) inset; color:inherit; text-decoration:none; transition: transform .22s ease, border-color .22s ease, box-shadow .22s ease, background .22s ease; animation: fadeSlideIn .35s ease both; position:relative; overflow:hidden; clip-path: polygon(0 0, calc(100% - 18px) 0, 100% 18px, 100% 100%, 18px 100%, 0 calc(100% - 18px)); backdrop-filter: blur(8px); }
+    .card::before { content:''; position:absolute; inset:0 auto 0 0; width:3px; background:linear-gradient(180deg, #22d3ee, #fde047, #e879f9); opacity:.9; }
+    .card::after { content:''; position:absolute; top:12px; right:12px; width:56px; height:1px; background:linear-gradient(90deg, rgba(253,224,71,.0), rgba(253,224,71,.9)); box-shadow: 0 0 12px rgba(253,224,71,.35); }
+    .card:hover { border-color:#22d3ee; transform: translateY(-4px) scale(1.01); box-shadow: 0 18px 38px rgba(8,145,178,.22), 0 0 0 1px rgba(253,224,71,.08) inset, 0 0 24px rgba(34,211,238,.12); background:linear-gradient(180deg, rgba(22,31,50,.98), rgba(14,22,36,.98)); }
+    .cardTitle { font-size:18px; font-weight:800; margin:0 0 10px; letter-spacing:.03em; }
     .desc { font-size:13px; color:#9fb0cb; margin:0; transition: color .22s ease; }
     .statusRow { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; }
-    .status { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; font-size:12px; font-weight:700; transition: transform .2s ease, box-shadow .2s ease; }
+    .status { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; font-size:12px; font-weight:800; letter-spacing:.04em; transition: transform .2s ease, box-shadow .2s ease; text-transform: uppercase; }
     .status.ok { background:#12351f; color:#86efac; border:1px solid #1f6f3d; }
     .status.warn { background:#3a2a12; color:#fdba74; border:1px solid #7c4a13; }
     .status.danger { background:#3b1620; color:#fca5a5; border:1px solid #9f1239; }
     .status.idle { background:#1f2937; color:#cbd5e1; border:1px solid #475569; }
-    .alertBox { margin: 0 0 16px; padding: 14px 16px; border-radius: 14px; border:1px solid #22304d; background:#121a2b; }
-    .alertBox.danger { border-color:#9f1239; background:#2a131a; }
-    .alertBox.warn { border-color:#7c4a13; background:#2b1d10; }
+    .alertBox { margin: 0 0 16px; padding: 14px 16px; border-radius: 14px; border:1px solid rgba(34,211,238,.22); background:linear-gradient(180deg, rgba(18,26,43,.72), rgba(12,18,31,.62)); box-shadow: 0 0 0 1px rgba(34,211,238,.05) inset; position:relative; overflow:hidden; backdrop-filter: blur(8px); }
+    .alertBox::before { content:'ALERT FEED'; position:absolute; top:10px; right:14px; font-size:10px; letter-spacing:.14em; color:rgba(250,204,21,.58); }
+    .alertBox.danger { border-color:#fb7185; background:linear-gradient(180deg, rgba(51,16,29,.96), rgba(35,13,22,.96)); }
+    .alertBox.warn { border-color:#f59e0b; background:linear-gradient(180deg, rgba(44,30,10,.96), rgba(30,20,8,.96)); }
     .alertList { margin:10px 0 0; padding-left:18px; color:#dbe7f6; }
     .alertList li { margin:6px 0; }
     .kv { display:grid; grid-template-columns: 86px 1fr; gap: 8px 12px; margin-top: 12px; }
     .value { min-width:0; word-break: break-all; overflow-wrap:anywhere; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    .preview { margin-top:12px; padding:10px 12px; background:#0a1020; border:1px solid #263554; border-radius:12px; color:#c8d6ec; font-size:12px; white-space:pre-wrap; word-break:break-word; max-height:92px; overflow:hidden; transition: border-color .22s ease, transform .22s ease, box-shadow .22s ease; }
+    .preview { margin-top:12px; padding:10px 12px; background:linear-gradient(180deg, rgba(8,16,30,.96), rgba(7,11,20,.98)); border:1px solid rgba(49,80,127,.7); border-radius:12px; color:#c8d6ec; font-size:12px; white-space:pre-wrap; word-break:break-word; max-height:92px; overflow:hidden; transition: border-color .22s ease, transform .22s ease, box-shadow .22s ease; box-shadow: inset 0 0 18px rgba(34,211,238,.03); }
     .card:hover .preview { border-color:#3b82f6; transform: translateY(-1px); box-shadow: inset 0 0 0 1px rgba(59,130,246,.18); }
     .actions { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
     .actions form { margin:0; display:inline-flex; }
-    .btn { display:inline-flex; align-items:center; justify-content:center; min-height:44px; padding:10px 16px; border-radius:10px; background:#1d2a44; border:1px solid #314667; color:#e5edf7; text-decoration:none; cursor:pointer; transition: transform .18s ease, border-color .18s ease, background .18s ease, box-shadow .18s ease; white-space:nowrap; line-height:1.2; vertical-align:middle; }
-    .btn:hover { transform: translateY(-1px); border-color:#3b82f6; background:#213251; box-shadow: 0 8px 20px rgba(29,78,216,.16); }
-    .detail { background:#121a2b; border:1px solid #22304d; border-radius:16px; padding:18px; animation: fadeSlideIn .3s ease both; }
-    .floatingClock { position: fixed; right: 18px; bottom: 18px; z-index: 9999; min-width: 220px; max-width: min(280px, calc(100vw - 24px)); padding: 12px 14px; border-radius: 14px; background: rgba(10,16,32,.88); border: 1px solid #314667; box-shadow: 0 10px 30px rgba(0,0,0,.35); backdrop-filter: blur(10px); transition: transform .22s ease, box-shadow .22s ease, border-color .22s ease, background .22s ease; }
-    .floatingClock:hover { transform: translateY(-3px); box-shadow: 0 16px 36px rgba(29,78,216,.18); border-color:#3b82f6; background: rgba(13,20,39,.94); }
+    .btn { display:inline-flex; align-items:center; justify-content:center; min-height:44px; padding:10px 16px; border-radius:10px; background:linear-gradient(180deg, rgba(20,32,54,.96), rgba(13,22,38,.96)); border:1px solid rgba(34,211,238,.24); color:#f8fbff; text-decoration:none; cursor:pointer; transition: transform .18s ease, border-color .18s ease, background .18s ease, box-shadow .18s ease; white-space:nowrap; line-height:1.2; vertical-align:middle; box-shadow: 0 0 0 1px rgba(253,224,71,.04) inset; clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 10px 100%, 0 calc(100% - 10px)); font-weight:700; letter-spacing:.03em; }
+    select.btn { appearance:auto; -webkit-appearance:menulist; padding-right:36px; }
+    select.btn option { color:#eaf4ff; background:#0f172a; }
+    select.btn optgroup { color:#fde047; background:#0b1220; }
+    .btn:hover { transform: translateY(-1px); border-color:#fde047; background:linear-gradient(180deg, rgba(28,42,69,.98), rgba(18,29,48,.98)); box-shadow: 0 8px 22px rgba(250,204,21,.14), 0 0 18px rgba(34,211,238,.10); }
+    .detail { background:linear-gradient(180deg, rgba(18,26,43,.72), rgba(12,18,31,.64)); border:1px solid rgba(34,211,238,.22); border-radius:16px; padding:52px 18px 18px; animation: fadeSlideIn .3s ease both; box-shadow: 0 0 0 1px rgba(34,211,238,.05) inset; position:relative; overflow:hidden; clip-path: polygon(0 0, calc(100% - 18px) 0, 100% 18px, 100% 100%, 18px 100%, 0 calc(100% - 18px)); backdrop-filter: blur(8px); }
+    .detail::before { content:'MODULE VIEW'; position:absolute; top:16px; left:18px; font-size:10px; letter-spacing:.14em; color:rgba(34,211,238,.55); }
+    .detailTools { display:flex; gap:10px; align-items:center; justify-content:space-between; flex-wrap:wrap; margin: 0 0 10px; min-height:44px; }
+    .searchInput { min-width: 220px; flex:1; max-width: 360px; }
+    .copyHint { font-size:12px; color:#8ea5c8; margin: 0 0 14px; }
+    .filterHidden { display:none !important; }
+    .floatingClock { position: fixed; right: 18px; bottom: 18px; z-index: 9999; min-width: 220px; max-width: min(280px, calc(100vw - 24px)); padding: 12px 14px; border-radius: 14px; background: linear-gradient(180deg, rgba(10,16,32,.70), rgba(16,24,39,.62)); border: 1px solid rgba(250,204,21,.36); box-shadow: 0 10px 30px rgba(0,0,0,.35), 0 0 18px rgba(250,204,21,.10); backdrop-filter: blur(10px); transition: transform .22s ease, box-shadow .22s ease, border-color .22s ease, background .22s ease; clip-path: polygon(0 0, calc(100% - 14px) 0, 100% 14px, 100% 100%, 14px 100%, 0 calc(100% - 14px)); }
+    .floatingClock:hover { transform: translateY(-3px); box-shadow: 0 16px 36px rgba(250,204,21,.18), 0 0 22px rgba(34,211,238,.14); border-color:#22d3ee; background: linear-gradient(180deg, rgba(13,20,39,.96), rgba(18,28,46,.98)); }
     .floatingClockLabel { font-size: 12px; color:#9fb0cb; margin-bottom: 6px; }
     .floatingClockTime { font-size: 18px; font-weight: 700; color:#e5edf7; }
-    .cyberPanel { position: fixed; right: 18px; top: 18px; z-index: 10000; width: min(360px, calc(100vw - 24px)); padding: 16px; border-radius: 16px; background: linear-gradient(180deg, rgba(10,16,32,.96), rgba(18,26,43,.94)); border: 1px solid rgba(59,130,246,.45); box-shadow: 0 18px 48px rgba(0,0,0,.42), 0 0 0 1px rgba(56,189,248,.08) inset; backdrop-filter: blur(14px); animation: fadeSlideIn .24s ease both; }
+    .cyberPanel { position: fixed; right: 18px; top: 18px; z-index: 10000; width: min(360px, calc(100vw - 24px)); padding: 16px; border-radius: 16px; background: linear-gradient(180deg, rgba(10,16,32,.78), rgba(18,26,43,.70)); border: 1px solid rgba(250,204,21,.42); box-shadow: 0 18px 48px rgba(0,0,0,.42), 0 0 0 1px rgba(34,211,238,.08) inset, 0 0 22px rgba(250,204,21,.10); backdrop-filter: blur(14px); animation: fadeSlideIn .24s ease both; }
     .cyberPanel[hidden] { display:none; }
     .cyberPanelTitle { margin:0 0 6px; font-size:16px; font-weight:800; color:#dbeafe; letter-spacing:.04em; }
     .cyberPanelDesc { margin:0 0 14px; color:#9fb0cb; font-size:12px; }
@@ -533,7 +654,8 @@ function layout(title, body, refreshSeconds = 0) {
     .status.ok { animation: pulseOk 2.8s ease-in-out infinite; }
     .status.warn { animation: pulseWarn 2.8s ease-in-out infinite; }
     .status.danger { animation: pulseDanger 1.8s ease-in-out infinite; }
-    .login { max-width: 420px; margin: 8vh auto; background:#121a2b; border:1px solid #22304d; border-radius:16px; padding:24px; box-shadow: 0 10px 30px rgba(0,0,0,.25); }
+    .login { max-width: 420px; margin: 8vh auto; background:linear-gradient(180deg, rgba(18,26,43,.76), rgba(12,18,31,.68)); border:1px solid rgba(250,204,21,.26); border-radius:16px; padding:24px; box-shadow: 0 10px 30px rgba(0,0,0,.25), 0 0 22px rgba(34,211,238,.08); clip-path: polygon(0 0, calc(100% - 18px) 0, 100% 18px, 100% 100%, 18px 100%, 0 calc(100% - 18px)); position:relative; overflow:hidden; backdrop-filter: blur(10px); }
+    .login::before { content:'ACCESS NODE'; position:absolute; top:12px; right:16px; font-size:10px; letter-spacing:.14em; color:rgba(250,204,21,.55); }
     .field { display:flex; flex-direction:column; gap:8px; margin-top:12px; }
     input { width:100%; padding:12px 14px; border-radius:12px; border:1px solid #314667; background:#0a1020; color:#e5edf7; }
     .error { margin-top: 12px; padding: 10px 12px; border-radius: 10px; background:#3a1c1c; color:#fecaca; border:1px solid #7f1d1d; }
@@ -554,6 +676,49 @@ function layout(title, body, refreshSeconds = 0) {
       0%, 100% { box-shadow: 0 0 0 0 rgba(244,63,94,0); }
       50% { box-shadow: 0 0 0 8px rgba(244,63,94,.14); }
     }
+    @keyframes sweepGlow {
+      0% { transform: translateX(-25%); opacity:.15; }
+      50% { opacity:.45; }
+      100% { transform: translateX(25%); opacity:.15; }
+    }
+    @keyframes pixelDrift {
+      0% { transform: translate3d(0, 0, 0); }
+      100% { transform: translate3d(-32px, 20px, 0); }
+    }
+    @keyframes pixelPulse {
+      0%, 100% { opacity:.24; transform: scale(1); }
+      50% { opacity:.46; transform: scale(1.015); }
+    }
+    @keyframes pixelSweep {
+      0% { transform: translateX(-4%); opacity:.12; }
+      50% { opacity:.28; }
+      100% { transform: translateX(4%); opacity:.12; }
+    }
+    @keyframes meteorFly1 {
+      0%, 14% { transform: translate3d(0, 0, 0) rotate(-22deg); opacity:0; }
+      18%, 34% { opacity:.88; }
+      48%, 100% { transform: translate3d(-120vw, 44vh, 0) rotate(-22deg); opacity:0; }
+    }
+    @keyframes meteorFly2 {
+      0%, 22% { transform: translate3d(0, 0, 0) rotate(-22deg); opacity:0; }
+      28%, 40% { opacity:.72; }
+      56%, 100% { transform: translate3d(-112vw, 38vh, 0) rotate(-22deg); opacity:0; }
+    }
+    @keyframes meteorFly3 {
+      0%, 18% { transform: translate3d(0, 0, 0) rotate(-22deg); opacity:0; }
+      24%, 38% { opacity:.9; }
+      50%, 100% { transform: translate3d(-118vw, 42vh, 0) rotate(-22deg); opacity:0; }
+    }
+    @keyframes meteorFly4 {
+      0%, 26% { transform: translate3d(0, 0, 0) rotate(-22deg); opacity:0; }
+      30%, 42% { opacity:.66; }
+      58%, 100% { transform: translate3d(-108vw, 34vh, 0) rotate(-22deg); opacity:0; }
+    }
+    @keyframes meteorFly5 {
+      0%, 20% { transform: translate3d(0, 0, 0) rotate(-22deg); opacity:0; }
+      26%, 38% { opacity:.8; }
+      54%, 100% { transform: translate3d(-116vw, 40vh, 0) rotate(-22deg); opacity:0; }
+    }
     @media (max-width: 900px) {
       .wrap { padding: 18px; }
       .topbar { flex-direction: column; align-items: stretch; }
@@ -566,6 +731,7 @@ function layout(title, body, refreshSeconds = 0) {
       .wrap { padding: 14px; }
       .title { font-size: 24px; }
       .grid { grid-template-columns: 1fr; }
+      .heroStats { grid-template-columns: 1fr 1fr; }
       .kv { grid-template-columns: 72px 1fr; }
       .card, .detail, .login { border-radius: 14px; }
       .floatingClock { right: 10px; bottom: 10px; left: 10px; min-width: 0; max-width: none; width: auto; padding: 10px 12px; }
@@ -573,10 +739,24 @@ function layout(title, body, refreshSeconds = 0) {
       .cyberPanel { right: 10px; left: 10px; top: 10px; width: auto; }
       .cyberPanelRow { flex-direction: column; align-items: stretch; }
       .cyberPanelRow .btn { width: 100%; }
+      .detailTools { flex-direction: column; align-items: stretch; }
+      .searchInput { max-width: none; width: 100%; }
     }
   </style>
 </head>
-<body data-now-ms="${nowMs}">${body}
+<body data-now-ms="${nowMs}">
+<div class="fxLayer fxGrid"></div>
+<div class="fxLayer fxPixels"></div>
+<div class="fxLayer meteorField">
+  <span class="meteor m1"></span>
+  <span class="meteor m2"></span>
+  <span class="meteor m3"></span>
+  <span class="meteor m4"></span>
+  <span class="meteor m5"></span>
+  <span class="meteor m6"></span>
+  <span class="meteor m7"></span>
+</div>
+${body}
 <div class="floatingClock">
   <div class="floatingClockLabel">当前时间</div>
   <div class="floatingClockTime mono" data-live-now>${new Date(nowMs).toISOString().slice(0, 19).replace('T', ' ')}</div>
@@ -668,6 +848,58 @@ function layout(title, body, refreshSeconds = 0) {
       if (selectEl.value !== 'custom') selectEl.dataset.previousValue = selectEl.value;
     });
   }
+  for (const btn of document.querySelectorAll('[data-copy-content]')) {
+    btn.addEventListener('click', async () => {
+      const text = btn.getAttribute('data-copy-content') || '';
+      try {
+        await navigator.clipboard.writeText(text);
+        const old = btn.textContent;
+        btn.textContent = '复制成功';
+        setTimeout(() => { btn.textContent = old; }, 1200);
+      } catch {
+        const old = btn.textContent;
+        btn.textContent = '复制失败';
+        setTimeout(() => { btn.textContent = old; }, 1200);
+      }
+    });
+  }
+  const filterInput = document.querySelector('[data-detail-filter]');
+  const detailRoot = document.querySelector('[data-detail-content]');
+  if (filterInput && detailRoot) {
+    filterInput.addEventListener('input', () => {
+      const keyword = String(filterInput.value || '').trim().toLowerCase();
+      const rows = detailRoot.querySelectorAll('tr, li, .kv > div, pre');
+      if (!rows.length) return;
+      if (detailRoot.querySelector('table')) {
+        detailRoot.querySelectorAll('tbody tr').forEach((row) => {
+          row.classList.toggle('filterHidden', !!keyword && !row.textContent.toLowerCase().includes(keyword));
+        });
+        return;
+      }
+      if (detailRoot.querySelector('ul')) {
+        detailRoot.querySelectorAll('li').forEach((row) => {
+          row.classList.toggle('filterHidden', !!keyword && !row.textContent.toLowerCase().includes(keyword));
+        });
+        return;
+      }
+      if (detailRoot.querySelector('.kv')) {
+        const cells = Array.from(detailRoot.querySelectorAll('.kv > div'));
+        for (let i = 0; i < cells.length; i += 2) {
+          const a = cells[i];
+          const b = cells[i + 1];
+          const text = ((a?.textContent || '') + ' ' + (b?.textContent || '')).toLowerCase();
+          const hide = !!keyword && !text.includes(keyword);
+          if (a) a.classList.toggle('filterHidden', hide);
+          if (b) b.classList.toggle('filterHidden', hide);
+        }
+        return;
+      }
+      const pre = detailRoot.querySelector('pre');
+      if (pre) {
+        pre.classList.toggle('filterHidden', false);
+      }
+    });
+  }
   tick();
   setInterval(tick, 1000);
 })();
@@ -706,6 +938,14 @@ function renderHome(data, refreshSeconds = 15) {
   const overview = modules.find(m => m.key === 'overview');
   const refreshLabel = formatRefreshLabel(refreshSeconds);
   const refreshOptions = buildRefreshOptions(refreshSeconds);
+  const memPercent = formatPercent(data.overview.usedMem, data.overview.totalMem);
+  const diskPeak = (data.diskUsage || []).reduce((max, item) => Number.isFinite(item.usePercent) ? Math.max(max, item.usePercent) : max, 0);
+  const heroStats = [
+    ['CPU 核心', String(data.overview.cpuCount || 'N/A'), truncateMiddle(data.overview.cpuModel || 'N/A', 32)],
+    ['内存占用', memPercent, `${formatBytes(data.overview.usedMem)} / ${formatBytes(data.overview.totalMem)}`],
+    ['磁盘峰值', diskPeak ? `${diskPeak}%` : 'N/A', `挂载点 ${(data.diskUsage || []).length} 个`],
+    ['告警状态', String(data.alerts.counts.critical || data.alerts.counts.warn ? data.alerts.counts.critical + data.alerts.counts.warn : 0), `严重 ${data.alerts.counts.critical} / 警告 ${data.alerts.counts.warn}`],
+  ].map(([label, value, sub]) => `<div class="heroStat"><div class="heroLabel">${htmlEscape(label)}</div><div class="heroValue mono">${htmlEscape(String(value))}</div><div class="heroSub">${htmlEscape(String(sub))}</div></div>`).join('');
   const cards = modules.filter(m => m.key !== 'overview').map(m => {
     const previewText = typeof m.content === 'string'
       ? m.content.split('\n').slice(0, 4).join('\n')
@@ -744,6 +984,8 @@ function renderHome(data, refreshSeconds = 15) {
         <form method="post" action="${BASE_PATH}/logout"><button class="btn" type="submit">退出登录</button></form>
       </div>
     </div>
+
+    <div class="heroStats">${heroStats}</div>
 
     <div class="alertBox ${htmlEscape(alertLevel)}">
       <div class="cardTitle" style="margin-bottom:4px;">告警总览</div>
@@ -790,6 +1032,23 @@ function renderModule(data, key, refreshSeconds = 15) {
           <tbody>${rows}</tbody>
         </table></div>`
       : `<div class="muted">当前没有容器</div>`;
+  } else if (key === 'processes') {
+    const rows = (data.processes || []).map(p => `<tr>
+      <td class="mono">${htmlEscape(p.pid)}</td>
+      <td class="mono">${htmlEscape(p.ppid)}</td>
+      <td class="mono">${htmlEscape(p.user)}</td>
+      <td><span class="status ${htmlEscape(p.state)}">CPU ${htmlEscape(p.cpu.toFixed(1))}%</span></td>
+      <td><span class="status ${htmlEscape(p.mem >= 30 ? 'danger' : (p.mem >= 10 ? 'warn' : 'ok'))}">MEM ${htmlEscape(p.mem.toFixed(1))}%</span></td>
+      <td class="mono">${htmlEscape(p.etime)}</td>
+      <td class="mono">${htmlEscape(p.comm)}</td>
+      <td class="mono" title="${htmlEscape(p.args)}">${htmlEscape(truncateMiddle(p.args, 68))}</td>
+    </tr>`).join('');
+    contentHtml = rows
+      ? `<div style="overflow:auto;"><table style="width:100%; border-collapse:collapse;">
+          <thead><tr><th style="text-align:left; padding:10px; border-bottom:1px solid #263554;">PID</th><th style="text-align:left; padding:10px; border-bottom:1px solid #263554;">PPID</th><th style="text-align:left; padding:10px; border-bottom:1px solid #263554;">用户</th><th style="text-align:left; padding:10px; border-bottom:1px solid #263554;">CPU</th><th style="text-align:left; padding:10px; border-bottom:1px solid #263554;">内存</th><th style="text-align:left; padding:10px; border-bottom:1px solid #263554;">运行时长</th><th style="text-align:left; padding:10px; border-bottom:1px solid #263554;">进程名</th><th style="text-align:left; padding:10px; border-bottom:1px solid #263554;">命令</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table></div>`
+      : `<div class="muted">当前没有可展示的进程数据</div>`;
   } else if (key === 'alerts') {
     contentHtml = data.alerts.items.length
       ? `<ul class="alertList">${data.alerts.items.map(item => `<li><span class="status ${item.level === 'critical' ? 'danger' : 'warn'}">${htmlEscape(item.level.toUpperCase())}</span> ${htmlEscape(item.text)}</li>`).join('')}</ul>`
@@ -801,6 +1060,11 @@ function renderModule(data, key, refreshSeconds = 15) {
   }
   const refreshLabel = formatRefreshLabel(refreshSeconds);
   const refreshOptions = buildRefreshOptions(refreshSeconds);
+  const moduleContentText = key === 'processes'
+    ? (data.processes || []).map(p => `${p.pid}\t${p.ppid}\t${p.user}\tCPU ${p.cpu.toFixed(1)}%\tMEM ${p.mem.toFixed(1)}%\t${p.etime}\t${p.comm}\t${p.args}`).join('\n')
+    : Array.isArray(mod.content)
+      ? mod.content.map(([k, v]) => `${k}: ${v}`).join('\n')
+      : String(mod.content || '');
   const body = `<div class="wrap">
     <div class="topbar">
       <div>
@@ -816,7 +1080,16 @@ function renderModule(data, key, refreshSeconds = 15) {
         <form method="post" action="${BASE_PATH}/logout"><button class="btn" type="submit">退出登录</button></form>
       </div>
     </div>
-    <div class="detail">${contentHtml}</div>
+    <div class="detail">
+      <div class="detailTools">
+        <input class="cyberInput searchInput" type="search" placeholder="筛选当前内容 / 表格行" data-detail-filter />
+        <div class="actions">
+          <button class="btn" type="button" data-copy-content="${htmlEscape(moduleContentText)}">复制当前模块</button>
+        </div>
+      </div>
+      <div class="copyHint">支持当前模块内容搜索过滤与一键复制。</div>
+      <div data-detail-content>${contentHtml}</div>
+    </div>
   </div>`;
   return layout(`${mod.title} - 系统信息面板`, body, refreshSeconds);
 }
