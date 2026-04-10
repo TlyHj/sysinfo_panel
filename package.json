@@ -1,0 +1,19 @@
+{
+  "name": "sysinfo-panel",
+  "version": "0.1.0",
+  "description": "A lightweight cyber-style system information panel built with Node.js.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "check": "node --check server.js"
+  },
+  "keywords": [
+    "sysinfo",
+    "panel",
+    "monitoring",
+    "dashboard",
+    "nodejs"
+  ],
+  "license": "MIT"
+}
