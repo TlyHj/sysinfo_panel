@@ -203,9 +203,20 @@ function getModuleStatus(key, data) {
     if (data.alerts.counts.warn > 0) return { text: `${data.alerts.counts.warn} 个告警`, tone: 'warn' };
     return { text: '正常', tone: 'ok' };
   }
+  if (key === 'logs') {
+    if (!data.logs || !data.logs.content || data.logs.content === 'N/A') return { text: '无数据', tone: 'warn' };
+    if (/error|failed|fatal|panic|crit|emerg|denied/i.test(data.logs.content)) return { text: '有异常', tone: 'warn' };
+    return { text: '可查看', tone: 'ok' };
+  }
+  if (key === 'services') {
+    if (!data.serviceDetail || !data.serviceDetail.present) return { text: '无数据', tone: 'warn' };
+    if (data.serviceDetail.active !== 'active') return { text: '有异常', tone: 'danger' };
+    return { text: '正常', tone: 'ok' };
+  }
   if (key === 'docker') {
     if (!data.docker || data.docker === 'N/A') return { text: '无数据', tone: 'warn' };
     if (!(data.dockerContainers || []).length) return { text: '空', tone: 'idle' };
+    if (data.dockerDetail && data.dockerDetail.present && data.dockerDetail.state === 'danger') return { text: '有异常', tone: 'danger' };
     const bad = data.dockerContainers.filter(c => c.state === 'danger');
     if (bad.length) return { text: `${bad.length} 异常`, tone: 'danger' };
     return { text: '正常', tone: 'ok' };
@@ -330,6 +341,132 @@ function getServiceSnapshot() {
   });
 }
 
+function getLogsSnapshot(selected = 'syslog') {
+  const sources = [
+    { key: 'syslog', label: '系统日志', cmd: "bash -lc 'journalctl -n 120 --no-pager 2>/dev/null || tail -n 120 /var/log/syslog 2>/dev/null || true'" },
+    { key: 'openclaw', label: 'OpenClaw', cmd: "bash -lc 'journalctl -u openclaw -n 120 --no-pager 2>/dev/null || true'" },
+    { key: 'nginx', label: 'Nginx', cmd: "bash -lc 'journalctl -u nginx -n 120 --no-pager 2>/dev/null || tail -n 120 /var/log/nginx/error.log 2>/dev/null || true'" },
+    { key: 'docker', label: 'Docker', cmd: "bash -lc 'journalctl -u docker -n 120 --no-pager 2>/dev/null || true'" },
+    { key: 'auth', label: '认证日志', cmd: "bash -lc 'journalctl -t sshd -n 120 --no-pager 2>/dev/null || tail -n 120 /var/log/auth.log 2>/dev/null || true'" },
+  ];
+  const source = sources.find(item => item.key === selected) || sources[0];
+  const content = run(source.cmd) || 'N/A';
+  return { selected: source.key, label: source.label, content: content || 'N/A', sources };
+}
+
+const MANAGED_SERVICES = ['openclaw', 'docker', 'nginx', 'ssh', 'fail2ban', 'tailscaled', 'caddy'];
+const SERVICE_ACTIONS = ['start', 'stop', 'restart'];
+const DOCKER_ACTIONS = ['start', 'stop', 'restart'];
+
+function runServiceAction(service, action) {
+  if (!MANAGED_SERVICES.includes(service) || !SERVICE_ACTIONS.includes(action)) {
+    return { ok: false, message: '非法操作' };
+  }
+  try {
+    execSync(`systemctl ${action} ${service}.service`, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 15000,
+    });
+    const active = run(`systemctl is-active ${service}.service 2>/dev/null || true`) || 'unknown';
+    return { ok: true, message: `${service} 已执行 ${action}，当前状态 ${active}` };
+  } catch (err) {
+    const stderr = String(err?.stderr || err?.stdout || '').trim();
+    return { ok: false, message: stderr || `${service} 执行 ${action} 失败` };
+  }
+}
+
+function getServiceDetailSnapshot(selected = 'openclaw') {
+  const allowed = MANAGED_SERVICES;
+  const service = allowed.includes(selected) ? selected : allowed[0];
+  const raw = run(`bash -lc 'if systemctl cat ${service}.service >/dev/null 2>&1; then echo "present=yes"; echo "name=${service}"; systemctl show ${service}.service -p Id -p Description -p ActiveState -p SubState -p UnitFileState -p MainPID -p ExecMainStartTimestamp -p FragmentPath --value 2>/dev/null | awk "NR==1{print \"id=\"\$0} NR==2{print \"description=\"\$0} NR==3{print \"active=\"\$0} NR==4{print \"sub=\"\$0} NR==5{print \"enabled=\"\$0} NR==6{print \"mainpid=\"\$0} NR==7{print \"startedAt=\"\$0} NR==8{print \"fragment=\"\$0}"; else echo "present=no"; fi'`);
+  const lines = String(raw || '').split('\n').filter(Boolean);
+  const map = Object.fromEntries(lines.map(line => {
+    const idx = line.indexOf('=');
+    return idx === -1 ? [line, ''] : [line.slice(0, idx), line.slice(idx + 1)];
+  }));
+  const present = map.present === 'yes';
+  const logs = present ? run(`bash -lc 'journalctl -u ${service} -n 80 --no-pager 2>/dev/null || true'`) : 'N/A';
+  return {
+    selected: service,
+    present,
+    options: allowed,
+    id: map.id || `${service}.service`,
+    description: map.description || 'N/A',
+    active: map.active || 'missing',
+    sub: map.sub || 'N/A',
+    enabled: map.enabled || 'N/A',
+    mainpid: map.mainpid || 'N/A',
+    startedAt: map.startedAt || 'N/A',
+    fragment: map.fragment || 'N/A',
+    logs: logs || 'N/A',
+  };
+}
+
+function runDockerAction(container, action) {
+  if (!container || !DOCKER_ACTIONS.includes(action)) {
+    return { ok: false, message: '非法操作' };
+  }
+  try {
+    execSync(`docker ${action} ${container}`, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 20000,
+    });
+    const status = run(`bash -lc 'docker inspect --format "{{.State.Status}}" ${container} 2>/dev/null || true'`) || 'unknown';
+    return { ok: true, message: `${container} 已执行 ${action}，当前状态 ${status}` };
+  } catch (err) {
+    const stderr = String(err?.stderr || err?.stdout || '').trim();
+    return { ok: false, message: stderr || `${container} 执行 ${action} 失败` };
+  }
+}
+
+function getDockerDetailSnapshot(containers, selected = '') {
+  const options = (containers || []).map(c => c.name).filter(Boolean);
+  const chosen = options.includes(selected) ? selected : (options[0] || '');
+  if (!chosen) {
+    return {
+      selected: '',
+      present: false,
+      options,
+      name: 'N/A',
+      image: 'N/A',
+      status: 'N/A',
+      state: 'idle',
+      ports: '-',
+      startedAt: 'N/A',
+      command: 'N/A',
+      restartCount: 'N/A',
+      logs: 'N/A',
+    };
+  }
+  const raw = run(`bash -lc 'docker inspect --format "name={{.Name}}\nimage={{.Config.Image}}\nstatus={{.State.Status}}\nrunning={{.State.Running}}\nstartedAt={{.State.StartedAt}}\nrestartCount={{.RestartCount}}\ncommand={{json .Config.Cmd}}\nports={{json .NetworkSettings.Ports}}" ${chosen} 2>/dev/null || true'`);
+  const map = Object.fromEntries(String(raw || '').split('\n').filter(Boolean).map(line => {
+    const idx = line.indexOf('=');
+    return idx === -1 ? [line, ''] : [line.slice(0, idx), line.slice(idx + 1)];
+  }));
+  const fromList = (containers || []).find(c => c.name === chosen);
+  const status = map.status || fromList?.status || 'unknown';
+  let state = fromList?.state || 'warn';
+  if (status === 'running') state = 'ok';
+  else if (['restarting', 'dead', 'exited'].includes(status)) state = 'danger';
+  const logs = run(`bash -lc 'docker logs --tail 80 ${chosen} 2>&1 || true'`) || 'N/A';
+  return {
+    selected: chosen,
+    present: true,
+    options,
+    name: chosen,
+    image: map.image || fromList?.image || 'N/A',
+    status,
+    state,
+    ports: fromList?.ports || '-',
+    startedAt: map.startedAt || 'N/A',
+    command: map.command || 'N/A',
+    restartCount: map.restartCount || '0',
+    logs,
+  };
+}
+
 function parseTopProcesses(raw) {
   if (!raw || raw === 'N/A') return [];
   const lines = raw.split('\n').map(s => s.trimEnd()).filter(Boolean);
@@ -409,7 +546,7 @@ function getAlertSummary(data) {
   return { counts, items: alerts };
 }
 
-function getData() {
+function getData(logSource = 'syslog', serviceName = 'openclaw', containerName = '') {
   const cpus = os.cpus() || [];
   const nets = os.networkInterfaces();
   const interfaces = [];
@@ -434,6 +571,10 @@ function getData() {
   const services = getServiceSnapshot();
   const docker = run('docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null | head -n 80');
   const top = run('ps -eo pid,ppid,user,%cpu,%mem,etime,comm,args --sort=-%cpu | head -n 30');
+  const logs = getLogsSnapshot(logSource);
+  const serviceDetail = getServiceDetailSnapshot(serviceName);
+  const dockerContainers = parseDockerContainers(docker);
+  const dockerDetail = getDockerDetailSnapshot(dockerContainers, containerName);
   const data = {
     time: formatBeijingTime(),
     listenSummary: getListenSummary(),
@@ -454,9 +595,12 @@ function getData() {
     diskUsage: parseDiskUsage(disk),
     listening: run('ss -tulpn 2>/dev/null | head -n 80'),
     docker,
-    dockerContainers: parseDockerContainers(docker),
+    dockerContainers,
+    dockerDetail,
     top,
     processes: parseTopProcesses(top),
+    logs,
+    serviceDetail,
     who: run('who 2>/dev/null | head -n 30'),
     lastLogins: run('last -n 20 2>/dev/null'),
     services,
@@ -472,6 +616,7 @@ function moduleDefs(data) {
   const servicesPreview = (data.services || []).filter(s => s.present).map(s => `${s.name}\t${s.active}\t${s.enabled}\t${s.sub}`).join('\n') || 'N/A';
   const dockerPreview = (data.dockerContainers || []).map(c => `${c.name}\t${c.status}\t${c.ports}`).join('\n') || 'N/A';
   const processPreview = (data.processes || []).slice(0, 8).map(p => `${p.pid}\t${p.user}\tCPU ${p.cpu.toFixed(1)}%\tMEM ${p.mem.toFixed(1)}%\t${p.comm}`).join('\n') || 'N/A';
+  const logsPreview = String(data.logs?.content || 'N/A').split('\n').slice(-8).join('\n') || 'N/A';
   const modules = [
     {
       key: 'overview',
@@ -509,6 +654,7 @@ function moduleDefs(data) {
     { key: 'ports', title: '监听端口', desc: '查看当前监听套接字与进程', content: data.listening },
     { key: 'docker', title: 'Docker 容器', desc: `共 ${(data.dockerContainers || []).length} 个容器`, content: dockerPreview },
     { key: 'processes', title: '进程监控', desc: `Top ${(data.processes || []).length} ｜ 按 CPU 排序`, content: processPreview },
+    { key: 'logs', title: '日志查看', desc: `当前源：${data.logs?.label || '系统日志'}`, content: logsPreview },
     { key: 'sessions', title: '当前登录', desc: '查看当前登录会话', content: data.who },
     { key: 'logins', title: '最近登录记录', desc: '查看 last 登录记录', content: data.lastLogins },
   ];
@@ -1004,7 +1150,7 @@ function renderHome(data, refreshSeconds = 15) {
   return layout('系统信息面板', body, refreshSeconds);
 }
 
-function renderModule(data, key, refreshSeconds = 15) {
+function renderModule(data, key, refreshSeconds = 15, actionNotice = null) {
   const mod = moduleDefs(data).find(m => m.key === key);
   if (!mod) return null;
   let contentHtml = '';
@@ -1015,10 +1161,47 @@ function renderModule(data, key, refreshSeconds = 15) {
       <td class="mono">${htmlEscape(s.enabled)}</td>
       <td class="mono">${htmlEscape(s.sub)}</td>
     </tr>`).join('');
-    contentHtml = `<div style="overflow:auto;"><table style="width:100%; border-collapse:collapse;">
+    const serviceOptions = (data.serviceDetail?.options || []).map(name => `<option value="${htmlEscape(name)}" ${name === data.serviceDetail.selected ? 'selected' : ''}>${htmlEscape(name)}</option>`).join('');
+    const detailTone = !data.serviceDetail?.present ? 'idle' : (data.serviceDetail.active === 'active' ? 'ok' : 'danger');
+    const noticeHtml = actionNotice ? `<div class="alertBox ${actionNotice.ok ? 'ok' : 'danger'}" style="margin-bottom:14px;"><div class="desc">${htmlEscape(actionNotice.message || '')}</div></div>` : '';
+    contentHtml = `${noticeHtml}<div style="display:flex; gap:10px; flex-wrap:wrap; margin:0 0 14px;">
+      <form method="get" action="${BASE_PATH}/module/services" class="actions" style="gap:10px;">
+        <select class="btn" name="service">${serviceOptions}</select>
+        <input type="hidden" name="refresh" value="${htmlEscape(String(refreshSeconds))}" />
+        <button class="btn" type="submit">查看详情</button>
+      </form>
+      <form method="post" action="${BASE_PATH}/service-action" class="actions" style="gap:10px; align-items:center;">
+        <input type="hidden" name="service" value="${htmlEscape(data.serviceDetail?.selected || '')}" />
+        <input type="hidden" name="refresh" value="${htmlEscape(String(refreshSeconds))}" />
+        <label class="muted" style="display:flex; align-items:center; gap:6px; font-size:12px;">
+          <input type="checkbox" name="confirm" value="yes" required />
+          我已确认本次服务操作
+        </label>
+        <button class="btn" type="submit" name="action" value="start">启动</button>
+        <button class="btn" type="submit" name="action" value="restart">重启</button>
+        <button class="btn" type="submit" name="action" value="stop">停止</button>
+      </form>
+    </div>
+    <div style="overflow:auto; margin-bottom:16px;"><table style="width:100%; border-collapse:collapse;">
       <thead><tr><th style="text-align:left; padding:10px; border-bottom:1px solid #263554;">服务</th><th style="text-align:left; padding:10px; border-bottom:1px solid #263554;">状态</th><th style="text-align:left; padding:10px; border-bottom:1px solid #263554;">开机自启</th><th style="text-align:left; padding:10px; border-bottom:1px solid #263554;">子状态</th></tr></thead>
       <tbody>${rows}</tbody>
-    </table></div>`;
+    </table></div>
+    <div class="card" style="text-decoration:none; margin-bottom:16px;">
+      <div class="statusRow">
+        <div class="cardTitle">服务详情：${htmlEscape(data.serviceDetail?.selected || 'N/A')}</div>
+        <span class="status ${htmlEscape(detailTone)}">${htmlEscape(data.serviceDetail?.active || 'missing')}</span>
+      </div>
+      <div class="kv">
+        <div class="muted">描述</div><div class="value mono">${htmlEscape(data.serviceDetail?.description || 'N/A')}</div>
+        <div class="muted">子状态</div><div class="value mono">${htmlEscape(data.serviceDetail?.sub || 'N/A')}</div>
+        <div class="muted">开机自启</div><div class="value mono">${htmlEscape(data.serviceDetail?.enabled || 'N/A')}</div>
+        <div class="muted">MainPID</div><div class="value mono">${htmlEscape(data.serviceDetail?.mainpid || 'N/A')}</div>
+        <div class="muted">启动时间</div><div class="value mono">${htmlEscape(data.serviceDetail?.startedAt || 'N/A')}</div>
+        <div class="muted">单元文件</div><div class="value mono">${htmlEscape(data.serviceDetail?.fragment || 'N/A')}</div>
+      </div>
+    </div>
+    <div class="copyHint">已附带该服务最近日志，默认 80 行。</div>
+    <pre class="mono">${htmlEscape(data.serviceDetail?.logs || 'N/A')}</pre>`;
   } else if (key === 'docker') {
     const rows = (data.dockerContainers || []).map(c => `<tr>
       <td class="mono">${htmlEscape(c.name)}</td>
@@ -1026,11 +1209,46 @@ function renderModule(data, key, refreshSeconds = 15) {
       <td><span class="status ${htmlEscape(c.state)}">${htmlEscape(c.status)}</span></td>
       <td class="mono">${htmlEscape(c.ports || '-')}</td>
     </tr>`).join('');
+    const containerOptions = (data.dockerDetail?.options || []).map(name => `<option value="${htmlEscape(name)}" ${name === data.dockerDetail.selected ? 'selected' : ''}>${htmlEscape(name)}</option>`).join('');
+    const noticeHtml = actionNotice ? `<div class="alertBox ${actionNotice.ok ? 'ok' : 'danger'}" style="margin-bottom:14px;"><div class="desc">${htmlEscape(actionNotice.message || '')}</div></div>` : '';
     contentHtml = rows
-      ? `<div style="overflow:auto;"><table style="width:100%; border-collapse:collapse;">
+      ? `${noticeHtml}<div style="display:flex; gap:10px; flex-wrap:wrap; margin:0 0 14px;">
+          <form method="get" action="${BASE_PATH}/module/docker" class="actions" style="gap:10px;">
+            <select class="btn" name="container">${containerOptions}</select>
+            <input type="hidden" name="refresh" value="${htmlEscape(String(refreshSeconds))}" />
+            <button class="btn" type="submit">查看详情</button>
+          </form>
+          <form method="post" action="${BASE_PATH}/docker-action" class="actions" style="gap:10px; align-items:center;">
+            <input type="hidden" name="container" value="${htmlEscape(data.dockerDetail?.selected || '')}" />
+            <input type="hidden" name="refresh" value="${htmlEscape(String(refreshSeconds))}" />
+            <label class="muted" style="display:flex; align-items:center; gap:6px; font-size:12px;">
+              <input type="checkbox" name="confirm" value="yes" required />
+              我已确认本次容器操作
+            </label>
+            <button class="btn" type="submit" name="action" value="start">启动</button>
+            <button class="btn" type="submit" name="action" value="restart">重启</button>
+            <button class="btn" type="submit" name="action" value="stop">停止</button>
+          </form>
+        </div>
+        <div style="overflow:auto; margin-bottom:16px;"><table style="width:100%; border-collapse:collapse;">
           <thead><tr><th style="text-align:left; padding:10px; border-bottom:1px solid #263554;">容器</th><th style="text-align:left; padding:10px; border-bottom:1px solid #263554;">镜像</th><th style="text-align:left; padding:10px; border-bottom:1px solid #263554;">状态</th><th style="text-align:left; padding:10px; border-bottom:1px solid #263554;">端口</th></tr></thead>
           <tbody>${rows}</tbody>
-        </table></div>`
+        </table></div>
+        <div class="card" style="text-decoration:none; margin-bottom:16px;">
+          <div class="statusRow">
+            <div class="cardTitle">容器详情：${htmlEscape(data.dockerDetail?.name || 'N/A')}</div>
+            <span class="status ${htmlEscape(data.dockerDetail?.state || 'idle')}">${htmlEscape(data.dockerDetail?.status || 'N/A')}</span>
+          </div>
+          <div class="kv">
+            <div class="muted">镜像</div><div class="value mono">${htmlEscape(data.dockerDetail?.image || 'N/A')}</div>
+            <div class="muted">端口</div><div class="value mono">${htmlEscape(data.dockerDetail?.ports || '-')}</div>
+            <div class="muted">启动时间</div><div class="value mono">${htmlEscape(data.dockerDetail?.startedAt || 'N/A')}</div>
+            <div class="muted">重启次数</div><div class="value mono">${htmlEscape(data.dockerDetail?.restartCount || '0')}</div>
+            <div class="muted">命令</div><div class="value mono">${htmlEscape(data.dockerDetail?.command || 'N/A')}</div>
+          </div>
+        </div>
+        <div class="copyHint">已附带该容器最近日志，默认 80 行。</div>
+        <pre class="mono">${htmlEscape(data.dockerDetail?.logs || 'N/A')}</pre>`
       : `<div class="muted">当前没有容器</div>`;
   } else if (key === 'processes') {
     const rows = (data.processes || []).map(p => `<tr>
@@ -1049,6 +1267,17 @@ function renderModule(data, key, refreshSeconds = 15) {
           <tbody>${rows}</tbody>
         </table></div>`
       : `<div class="muted">当前没有可展示的进程数据</div>`;
+  } else if (key === 'logs') {
+    const sourceOptions = (data.logs?.sources || []).map(item => `<option value="${htmlEscape(item.key)}" ${item.key === data.logs.selected ? 'selected' : ''}>${htmlEscape(item.label)}</option>`).join('');
+    contentHtml = `<div style="display:flex; gap:10px; flex-wrap:wrap; margin:0 0 14px;">
+      <form method="get" action="${BASE_PATH}/module/logs" class="actions" style="gap:10px;">
+        <select class="btn" name="source">${sourceOptions}</select>
+        <input type="hidden" name="refresh" value="${htmlEscape(String(refreshSeconds))}" />
+        <button class="btn" type="submit">切换日志源</button>
+      </form>
+    </div>
+    <div class="copyHint">当前日志源：${htmlEscape(data.logs?.label || '系统日志')} ｜ 默认展示最近 120 行。</div>
+    <pre class="mono">${htmlEscape(data.logs?.content || 'N/A')}</pre>`;
   } else if (key === 'alerts') {
     contentHtml = data.alerts.items.length
       ? `<ul class="alertList">${data.alerts.items.map(item => `<li><span class="status ${item.level === 'critical' ? 'danger' : 'warn'}">${htmlEscape(item.level.toUpperCase())}</span> ${htmlEscape(item.text)}</li>`).join('')}</ul>`
@@ -1062,7 +1291,30 @@ function renderModule(data, key, refreshSeconds = 15) {
   const refreshOptions = buildRefreshOptions(refreshSeconds);
   const moduleContentText = key === 'processes'
     ? (data.processes || []).map(p => `${p.pid}\t${p.ppid}\t${p.user}\tCPU ${p.cpu.toFixed(1)}%\tMEM ${p.mem.toFixed(1)}%\t${p.etime}\t${p.comm}\t${p.args}`).join('\n')
-    : Array.isArray(mod.content)
+    : key === 'logs'
+      ? String(data.logs?.content || '')
+      : key === 'services'
+        ? [`服务: ${data.serviceDetail?.selected || 'N/A'}`,
+           `描述: ${data.serviceDetail?.description || 'N/A'}`,
+           `状态: ${data.serviceDetail?.active || 'N/A'}`,
+           `子状态: ${data.serviceDetail?.sub || 'N/A'}`,
+           `开机自启: ${data.serviceDetail?.enabled || 'N/A'}`,
+           `MainPID: ${data.serviceDetail?.mainpid || 'N/A'}`,
+           `启动时间: ${data.serviceDetail?.startedAt || 'N/A'}`,
+           `单元文件: ${data.serviceDetail?.fragment || 'N/A'}`,
+           '',
+           String(data.serviceDetail?.logs || 'N/A')].join('\n')
+      : key === 'docker'
+        ? [`容器: ${data.dockerDetail?.name || 'N/A'}`,
+           `镜像: ${data.dockerDetail?.image || 'N/A'}`,
+           `状态: ${data.dockerDetail?.status || 'N/A'}`,
+           `端口: ${data.dockerDetail?.ports || '-'}`,
+           `启动时间: ${data.dockerDetail?.startedAt || 'N/A'}`,
+           `重启次数: ${data.dockerDetail?.restartCount || '0'}`,
+           `命令: ${data.dockerDetail?.command || 'N/A'}`,
+           '',
+           String(data.dockerDetail?.logs || 'N/A')].join('\n')
+        : Array.isArray(mod.content)
       ? mod.content.map(([k, v]) => `${k}: ${v}`).join('\n')
       : String(mod.content || '');
   const body = `<div class="wrap">
@@ -1099,12 +1351,20 @@ async function handler(req, res) {
   const method = req.method || 'GET';
   const pathname = url.pathname;
   const refreshSeconds = getRefreshSeconds(url.searchParams.get('refresh'));
+  const logSource = String(url.searchParams.get('source') || 'syslog');
+  const serviceName = String(url.searchParams.get('service') || 'openclaw');
+  const containerName = String(url.searchParams.get('container') || '');
+  const actionNotice = url.searchParams.has('action_ok') || url.searchParams.has('action_msg')
+    ? { ok: url.searchParams.get('action_ok') === '1', message: String(url.searchParams.get('action_msg') || '') }
+    : null;
   const isGetLike = method === 'GET' || method === 'HEAD';
   const isHome = pathname === '/' || pathname === BASE_PATH || pathname === `${BASE_PATH}/`;
   const isHealth = pathname === '/healthz' || pathname === `${BASE_PATH}/healthz`;
   const isApi = pathname === '/api/system' || pathname === `${BASE_PATH}/api/system`;
   const isLogin = pathname === '/login' || pathname === `${BASE_PATH}/login`;
   const isLogout = pathname === '/logout' || pathname === `${BASE_PATH}/logout`;
+  const isServiceAction = pathname === '/service-action' || pathname === `${BASE_PATH}/service-action`;
+  const isDockerAction = pathname === '/docker-action' || pathname === `${BASE_PATH}/docker-action`;
   const modulePrefix = `${BASE_PATH}/module/`;
   const plainModulePrefix = '/module/';
 
@@ -1160,15 +1420,49 @@ async function handler(req, res) {
     return;
   }
 
+  if (method === 'POST' && isServiceAction) {
+    try {
+      const raw = await readRequestBody(req);
+      const params = new URLSearchParams(raw);
+      const service = String(params.get('service') || 'openclaw');
+      const action = String(params.get('action') || 'restart');
+      const refresh = getRefreshSeconds(params.get('refresh'));
+      const confirmed = String(params.get('confirm') || '') === 'yes';
+      const result = confirmed ? runServiceAction(service, action) : { ok: false, message: '请先勾选确认后再执行服务操作' };
+      redirect(res, `${BASE_PATH}/module/services?service=${encodeURIComponent(service)}&refresh=${refresh}&action_ok=${result.ok ? '1' : '0'}&action_msg=${encodeURIComponent(result.message)}`);
+      return;
+    } catch {
+      redirect(res, `${BASE_PATH}/module/services?service=${encodeURIComponent(serviceName)}&refresh=${refreshSeconds}&action_ok=0&action_msg=${encodeURIComponent('请求解析失败')}`);
+      return;
+    }
+  }
+
+  if (method === 'POST' && isDockerAction) {
+    try {
+      const raw = await readRequestBody(req);
+      const params = new URLSearchParams(raw);
+      const container = String(params.get('container') || '');
+      const action = String(params.get('action') || 'restart');
+      const refresh = getRefreshSeconds(params.get('refresh'));
+      const confirmed = String(params.get('confirm') || '') === 'yes';
+      const result = confirmed ? runDockerAction(container, action) : { ok: false, message: '请先勾选确认后再执行容器操作' };
+      redirect(res, `${BASE_PATH}/module/docker?container=${encodeURIComponent(container)}&refresh=${refresh}&action_ok=${result.ok ? '1' : '0'}&action_msg=${encodeURIComponent(result.message)}`);
+      return;
+    } catch {
+      redirect(res, `${BASE_PATH}/module/docker?container=${encodeURIComponent(containerName)}&refresh=${refreshSeconds}&action_ok=0&action_msg=${encodeURIComponent('请求解析失败')}`);
+      return;
+    }
+  }
+
   if (isGetLike && isApi) {
-    const body = JSON.stringify(getData(), null, 2);
+    const body = JSON.stringify(getData(logSource, serviceName, containerName), null, 2);
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(method === 'HEAD' ? '' : body);
     return;
   }
 
   if (isGetLike && isHome) {
-    const body = renderHome(getData(), refreshSeconds);
+    const body = renderHome(getData(logSource, serviceName, containerName), refreshSeconds);
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(method === 'HEAD' ? '' : body);
     return;
@@ -1178,7 +1472,7 @@ async function handler(req, res) {
     const key = pathname.startsWith(modulePrefix)
       ? decodeURIComponent(pathname.slice(modulePrefix.length))
       : decodeURIComponent(pathname.slice(plainModulePrefix.length));
-    const body = renderModule(getData(), key, refreshSeconds);
+    const body = renderModule(getData(logSource, serviceName, containerName), key, refreshSeconds, (key === 'services' || key === 'docker') ? actionNotice : null);
     if (!body) {
       res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end(method === 'HEAD' ? '' : 'Not found');
