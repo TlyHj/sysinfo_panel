@@ -1,0 +1,13 @@
+# runtime / secrets
+/data/
+/logs/
+/certs/
+
+# local artifacts
+*.zip
+*.log
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
