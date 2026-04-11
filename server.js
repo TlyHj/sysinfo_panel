@@ -9,6 +9,7 @@ const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, 'data');
 const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 const INITIAL_PASSWORD_PATH = path.join(DATA_DIR, 'initial-password.txt');
+const ALERTS_STATE_PATH = path.join(DATA_DIR, 'alerts-state.json');
 const FORCE_PUBLIC_IP = '8.137.127.174';
 const PORT = Number.parseInt(process.env.PORT || '18888', 10);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -77,6 +78,41 @@ function ensureRuntimeFiles() {
   if (!fs.existsSync(INITIAL_PASSWORD_PATH)) {
     fs.writeFileSync(INITIAL_PASSWORD_PATH, `${DEFAULT_PASSWORD}\n`);
   }
+  if (!fs.existsSync(ALERTS_STATE_PATH)) {
+    fs.writeFileSync(ALERTS_STATE_PATH, JSON.stringify({ acknowledged: {}, recovered: [] }, null, 2));
+  }
+}
+
+function readAlertsState() {
+  ensureRuntimeFiles();
+  try {
+    const raw = fs.readFileSync(ALERTS_STATE_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    return {
+      acknowledged: parsed && typeof parsed.acknowledged === 'object' && parsed.acknowledged ? parsed.acknowledged : {},
+      recovered: Array.isArray(parsed?.recovered) ? parsed.recovered : [],
+    };
+  } catch {
+    return { acknowledged: {}, recovered: [] };
+  }
+}
+
+function writeAlertsState(state) {
+  ensureRuntimeFiles();
+  fs.writeFileSync(ALERTS_STATE_PATH, JSON.stringify({
+    acknowledged: state?.acknowledged || {},
+    recovered: Array.isArray(state?.recovered) ? state.recovered.slice(0, 50) : [],
+  }, null, 2));
+}
+
+function getAlertId(item) {
+  return crypto.createHash('sha1').update(`${item.level}|${item.text}`).digest('hex').slice(0, 12);
+}
+
+function acknowledgeAlertById(id) {
+  const state = readAlertsState();
+  state.acknowledged[id] = { at: Date.now() };
+  writeAlertsState(state);
 }
 
 function readAuthConfig() {
@@ -538,12 +574,38 @@ function getAlertSummary(data) {
     if (p.mem >= 30) alerts.push({ level: 'warn', text: `高内存进程：PID ${p.pid} ${p.comm} 占用 ${p.mem.toFixed(1)}%` });
   }
 
-  const counts = alerts.reduce((acc, item) => {
+  const state = readAlertsState();
+  const withIds = alerts.map(item => ({ ...item, id: getAlertId(item) }));
+  const currentIds = new Set(withIds.map(item => item.id));
+  const active = [];
+  const acknowledged = [];
+  for (const item of withIds) {
+    if (state.acknowledged[item.id]) acknowledged.push(item);
+    else active.push(item);
+  }
+  const recovered = [];
+  for (const [id, meta] of Object.entries(state.acknowledged || {})) {
+    if (!currentIds.has(id)) {
+      recovered.unshift({ id, text: `告警已恢复：${id}`, level: 'info', at: meta?.at || Date.now() });
+      delete state.acknowledged[id];
+    }
+  }
+  const recoveredMerged = [...recovered, ...(state.recovered || [])].slice(0, 20);
+  state.recovered = recoveredMerged;
+  writeAlertsState(state);
+
+  const counts = active.reduce((acc, item) => {
     acc[item.level] = (acc[item.level] || 0) + 1;
     return acc;
   }, { critical: 0, warn: 0, info: 0 });
 
-  return { counts, items: alerts };
+  return {
+    counts,
+    items: active,
+    acknowledged,
+    recovered: recoveredMerged,
+    total: withIds.length,
+  };
 }
 
 function getData(logSource = 'syslog', serviceName = 'openclaw', containerName = '') {
@@ -612,7 +674,7 @@ function getData(logSource = 'syslog', serviceName = 'openclaw', containerName =
 function moduleDefs(data) {
   const alertPreview = data.alerts.items.length
     ? data.alerts.items.map(item => `[${item.level.toUpperCase()}] ${item.text}`).join('\n')
-    : '当前没有触发中的告警';
+    : (data.alerts.acknowledged?.length ? `当前告警已全部确认（${data.alerts.acknowledged.length} 条）` : '当前没有触发中的告警');
   const servicesPreview = (data.services || []).filter(s => s.present).map(s => `${s.name}\t${s.active}\t${s.enabled}\t${s.sub}`).join('\n') || 'N/A';
   const dockerPreview = (data.dockerContainers || []).map(c => `${c.name}\t${c.status}\t${c.ports}`).join('\n') || 'N/A';
   const processPreview = (data.processes || []).slice(0, 8).map(p => `${p.pid}\t${p.user}\tCPU ${p.cpu.toFixed(1)}%\tMEM ${p.mem.toFixed(1)}%\t${p.comm}`).join('\n') || 'N/A';
@@ -763,6 +825,7 @@ function layout(title, body, refreshSeconds = 0) {
     .status.idle { background:#1f2937; color:#cbd5e1; border:1px solid #475569; }
     .alertBox { margin: 0 0 16px; padding: 14px 16px; border-radius: 14px; border:1px solid rgba(34,211,238,.22); background:linear-gradient(180deg, rgba(18,26,43,.72), rgba(12,18,31,.62)); box-shadow: 0 0 0 1px rgba(34,211,238,.05) inset; position:relative; overflow:hidden; backdrop-filter: blur(8px); }
     .alertBox::before { content:'ALERT FEED'; position:absolute; top:10px; right:14px; font-size:10px; letter-spacing:.14em; color:rgba(250,204,21,.58); }
+    .alertBox.alertOverview::before { display:none; }
     .alertBox.danger { border-color:#fb7185; background:linear-gradient(180deg, rgba(51,16,29,.96), rgba(35,13,22,.96)); }
     .alertBox.warn { border-color:#f59e0b; background:linear-gradient(180deg, rgba(44,30,10,.96), rgba(30,20,8,.96)); }
     .alertList { margin:10px 0 0; padding-left:18px; color:#dbe7f6; }
@@ -1113,8 +1176,8 @@ function renderHome(data, refreshSeconds = 15) {
 
   const alertLevel = data.alerts.counts.critical > 0 ? 'danger' : (data.alerts.counts.warn > 0 ? 'warn' : 'ok');
   const alertSummary = data.alerts.items.length
-    ? `<ul class="alertList">${data.alerts.items.slice(0, 6).map(item => `<li>[${htmlEscape(item.level.toUpperCase())}] ${htmlEscape(item.text)}</li>`).join('')}</ul>`
-    : '<div class="muted" style="margin-top:10px;">当前没有触发中的告警</div>';
+    ? `<div style="display:grid; gap:10px; margin-top:12px;">${data.alerts.items.slice(0, 4).map(item => `<div style="padding:12px 14px; border-radius:14px; border:1px solid ${item.level === 'critical' ? 'rgba(255,76,76,.45)' : 'rgba(255,184,77,.35)'}; background:${item.level === 'critical' ? 'linear-gradient(180deg, rgba(255,76,76,.14), rgba(255,76,76,.05))' : 'linear-gradient(180deg, rgba(255,184,77,.12), rgba(255,184,77,.05))'}; box-shadow:${item.level === 'critical' ? '0 0 24px rgba(255,76,76,.12)' : '0 0 20px rgba(255,184,77,.08)'};"><div style="display:flex; justify-content:space-between; gap:10px; align-items:center;"><span class="status ${item.level === 'critical' ? 'danger' : 'warn'}">${htmlEscape(item.level.toUpperCase())}</span><span class="muted mono" style="font-size:12px;">${htmlEscape(item.id)}</span></div><div style="margin-top:8px; line-height:1.6; color:#f3f7ff;">${htmlEscape(item.text)}</div></div>`).join('')}</div>`
+    : `<div class="muted" style="margin-top:10px;">${data.alerts.acknowledged?.length ? `当前告警已确认 ${data.alerts.acknowledged.length} 条` : '当前没有触发中的告警'}</div>`;
 
   const body = `<div class="wrap">
     <div class="topbar">
@@ -1133,10 +1196,20 @@ function renderHome(data, refreshSeconds = 15) {
 
     <div class="heroStats">${heroStats}</div>
 
-    <div class="alertBox ${htmlEscape(alertLevel)}">
-      <div class="cardTitle" style="margin-bottom:4px;">告警总览</div>
-      <div class="desc">严重 ${data.alerts.counts.critical} ｜ 警告 ${data.alerts.counts.warn}</div>
+    <div class="alertBox alertOverview ${htmlEscape(alertLevel)}" style="padding:18px 18px 16px; border-radius:18px; overflow:hidden; position:relative;">
+      <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:14px; flex-wrap:wrap;">
+        <div>
+          <div class="cardTitle" style="margin-bottom:4px;">告警总览</div>
+          <div class="desc">严重 ${data.alerts.counts.critical} ｜ 警告 ${data.alerts.counts.warn} ｜ 已确认 ${data.alerts.acknowledged?.length || 0}</div>
+        </div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <span class="status danger">严重 ${data.alerts.counts.critical}</span>
+          <span class="status warn">警告 ${data.alerts.counts.warn}</span>
+          <span class="status idle">已确认 ${data.alerts.acknowledged?.length || 0}</span>
+        </div>
+      </div>
       ${alertSummary}
+      ${(data.alerts.acknowledged?.length || data.alerts.recovered?.length) ? `<div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:14px;"><div style="flex:1; min-width:220px; padding:12px 14px; border-radius:14px; border:1px solid rgba(119,139,180,.24); background:rgba(16,26,44,.45);"><div class="muted" style="margin-bottom:6px;">已确认</div><div class="value mono">${htmlEscape(String(data.alerts.acknowledged?.length || 0))} 条</div></div><div style="flex:1; min-width:220px; padding:12px 14px; border-radius:14px; border:1px solid rgba(73,214,162,.2); background:rgba(10,34,28,.38);"><div class="muted" style="margin-bottom:6px;">最近恢复</div><div class="value mono">${htmlEscape(String(data.alerts.recovered?.length || 0))} 条</div></div></div>` : ''}
     </div>
 
     <div class="card" style="margin-bottom:16px; text-decoration:none;">
@@ -1279,9 +1352,16 @@ function renderModule(data, key, refreshSeconds = 15, actionNotice = null) {
     <div class="copyHint">当前日志源：${htmlEscape(data.logs?.label || '系统日志')} ｜ 默认展示最近 120 行。</div>
     <pre class="mono">${htmlEscape(data.logs?.content || 'N/A')}</pre>`;
   } else if (key === 'alerts') {
-    contentHtml = data.alerts.items.length
-      ? `<ul class="alertList">${data.alerts.items.map(item => `<li><span class="status ${item.level === 'critical' ? 'danger' : 'warn'}">${htmlEscape(item.level.toUpperCase())}</span> ${htmlEscape(item.text)}</li>`).join('')}</ul>`
-      : `<div class="muted">当前没有触发中的告警</div>`;
+    const activeHtml = data.alerts.items.length
+      ? `<div style="display:grid; gap:12px;">${data.alerts.items.map(item => `<div style="padding:14px 16px; border-radius:16px; border:1px solid ${item.level === 'critical' ? 'rgba(255,76,76,.45)' : 'rgba(255,184,77,.35)'}; background:${item.level === 'critical' ? 'linear-gradient(180deg, rgba(255,76,76,.16), rgba(255,76,76,.05))' : 'linear-gradient(180deg, rgba(255,184,77,.12), rgba(255,184,77,.05))'};"><div style="display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap;"><div style="flex:1; min-width:240px;"><div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;"><span class="status ${item.level === 'critical' ? 'danger' : 'warn'}">${htmlEscape(item.level.toUpperCase())}</span><span class="muted mono" style="font-size:12px;">${htmlEscape(item.id)}</span></div><div style="margin-top:9px; line-height:1.7; color:#f4f7ff;">${htmlEscape(item.text)}</div></div><form method="post" action="${BASE_PATH}/alert-action" class="actions" style="gap:8px;"><input type="hidden" name="id" value="${htmlEscape(item.id)}" /><input type="hidden" name="refresh" value="${htmlEscape(String(refreshSeconds))}" /><button class="btn" type="submit">确认</button></form></div></div>`).join('')}</div>`
+      : `<div class="muted">当前没有未确认告警</div>`;
+    const ackHtml = data.alerts.acknowledged?.length
+      ? `<div style="display:grid; gap:10px;">${data.alerts.acknowledged.map(item => `<div style="padding:12px 14px; border-radius:14px; border:1px solid rgba(119,139,180,.2); background:rgba(16,26,44,.42);"><span class="status idle">已确认</span><div style="margin-top:8px; color:#cbd7f5; line-height:1.65;">${htmlEscape(item.text)}</div></div>`).join('')}</div>`
+      : `<div class="muted">当前没有已确认但未恢复的告警</div>`;
+    const recoveredHtml = data.alerts.recovered?.length
+      ? `<div style="display:grid; gap:10px;">${data.alerts.recovered.slice(0, 10).map(item => `<div style="padding:12px 14px; border-radius:14px; border:1px solid rgba(73,214,162,.18); background:rgba(10,34,28,.34);"><span class="status ok">已恢复</span><div style="margin-top:8px; color:#bdebdc; line-height:1.65;">${htmlEscape(item.text)}</div></div>`).join('')}</div>`
+      : `<div class="muted">当前没有最近恢复记录</div>`;
+    contentHtml = `<div class="card" style="text-decoration:none; margin-bottom:16px; border-color:rgba(255,107,107,.28); box-shadow:0 0 30px rgba(255,90,90,.08);"><div class="cardTitle">当前告警</div><p class="desc">只展示未确认的触发项，重点突出。</p>${activeHtml}</div><div class="card" style="text-decoration:none; margin-bottom:16px; opacity:.9;"><div class="cardTitle">已确认告警</div><p class="desc">问题仍存在，但已从强提醒区移出。</p>${ackHtml}</div><div class="card" style="text-decoration:none; opacity:.88;"><div class="cardTitle">最近恢复</div><p class="desc">已恢复的告警自动归档，视觉上更轻。</p>${recoveredHtml}</div>`;
   } else if (Array.isArray(mod.content)) {
     contentHtml = `<div class="kv">${mod.content.map(([k, v]) => `<div class="muted">${htmlEscape(k)}</div><div class="value mono">${htmlEscape(v)}</div>`).join('')}</div>`;
   } else {
@@ -1365,6 +1445,7 @@ async function handler(req, res) {
   const isLogout = pathname === '/logout' || pathname === `${BASE_PATH}/logout`;
   const isServiceAction = pathname === '/service-action' || pathname === `${BASE_PATH}/service-action`;
   const isDockerAction = pathname === '/docker-action' || pathname === `${BASE_PATH}/docker-action`;
+  const isAlertAction = pathname === '/alert-action' || pathname === `${BASE_PATH}/alert-action`;
   const modulePrefix = `${BASE_PATH}/module/`;
   const plainModulePrefix = '/module/';
 
@@ -1450,6 +1531,21 @@ async function handler(req, res) {
       return;
     } catch {
       redirect(res, `${BASE_PATH}/module/docker?container=${encodeURIComponent(containerName)}&refresh=${refreshSeconds}&action_ok=0&action_msg=${encodeURIComponent('请求解析失败')}`);
+      return;
+    }
+  }
+
+  if (method === 'POST' && isAlertAction) {
+    try {
+      const raw = await readRequestBody(req);
+      const params = new URLSearchParams(raw);
+      const id = String(params.get('id') || '');
+      const refresh = getRefreshSeconds(params.get('refresh'));
+      if (id) acknowledgeAlertById(id);
+      redirect(res, `${BASE_PATH}/module/alerts?refresh=${refresh}`);
+      return;
+    } catch {
+      redirect(res, `${BASE_PATH}/module/alerts?refresh=${refreshSeconds}`);
       return;
     }
   }
